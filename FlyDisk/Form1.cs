@@ -1494,7 +1494,7 @@ namespace FlyDisk
         /// 重试用**同一块盘**（不再弹选盘框）：用户刚选过，且这是程序自己发起的动作。
         ///
         /// ⚠ 为什么每处都要等 1 秒、停止还要试 3 次：刚建立起来的 iSCSI 会话**没法立刻登出**，实测第一次
-        /// Stop 会被"还有 iSCSI 连接挂着"拒掉（见 <see cref="TryStopForCloneRecovery"/>）。
+        /// Stop 会被"还有 iSCSI 连接挂着"拒掉（见 <see cref="TryStopWithRetry"/>）。
         /// ⚠ 全程 await 后台任务，不阻塞 UI 线程（启停已移到后台，见 <see cref="StartTarget"/>）。
         /// </summary>
         private async Task RecoverFromCloneDiskProblem(PhysicalDiskInfo target)
@@ -1506,7 +1506,7 @@ namespace FlyDisk
             await Task.Delay(CloneRetryDelayMs);
 
             // ② 停止加速全流程（最多试 3 次）。一直停不下来就没法干净地重来，如实收尾、不再往下走。
-            (bool ok, string stopError) = await TryStopForCloneRecovery();
+            (bool ok, string stopError) = await TryStopWithRetry();
             if (!ok)
             {
                 Log(Locale.T("main.log.cloneRetryStopFailed", CloneRetryStopAttempts, stopError));
@@ -1543,7 +1543,7 @@ namespace FlyDisk
             // 先等 1 秒再停（同 ① 的道理）：刚重新启动过，那条新会话立刻登出同样会被拒
             await Task.Delay(CloneRetryDelayMs);
             // 再走"带重试的停止"（同 ② 的道理）：那条新会话也可能一下摘不干净
-            (bool ok2, string finalStopError) = await TryStopForCloneRecovery();
+            (bool ok2, string finalStopError) = await TryStopWithRetry();
             if (!ok2)
             {
                 // 停不下来就还处于"仍在加速"的状态：日志如实写出，别让用户以为已经停了
@@ -1554,14 +1554,16 @@ namespace FlyDisk
         }
 
         /// <summary>
-        /// 停止加速（自动恢复专用）：**最多试 <see cref="CloneRetryStopAttempts"/> 次**，每次之间等 1 秒。
+        /// 停止加速（**带重试**）：最多试 <see cref="CloneRetryStopAttempts"/> 次，每次之间等
+        /// <see cref="CloneRetryDelayMs"/>。**克隆盘自动恢复与用户点「停止加速」共用它**。
         ///
         /// 为什么要试多次：刚建立起来的 iSCSI 会话**没法立刻登出**（实测第一次 Stop 会被"还有 iSCSI 连接挂着"
-        /// 拒掉）。<c>Disconnect</c> 本身是幂等的（登出没成功就留着会话，下次调用再试），所以这里只要按节拍
-        /// 把"再试一次"做够次数，登出通常在下一次就成功了。
+        /// 拒掉）；设备一时忙（<c>ISDSC_DEVICE_BUSY_ON_SESSION</c>）也可能再试几次就摘干净。<c>Disconnect</c>
+        /// 本身是幂等的（登出没成功就留着会话，下次调用再试），所以这里只要按节拍把"再试一次"做够次数，
+        /// 登出通常在下一次就成功了。
         /// </summary>
         /// <returns>停下来了返回 (true, 空串)；否则 (false, 最后一次错误)</returns>
-        private async Task<(bool ok, string error)> TryStopForCloneRecovery()
+        private async Task<(bool ok, string error)> TryStopWithRetry()
         {
             string error = string.Empty;
             for (int attempt = 1; attempt <= CloneRetryStopAttempts; attempt++)
@@ -1570,7 +1572,7 @@ namespace FlyDisk
                 if (stopped.Ok) return (true, string.Empty);
 
                 error = stopped.Message;   // 被拒（例如会话还没登出去）⇒ 等一拍再来
-                LogService.DebugFile($"克隆盘恢复：停止加速第 {attempt}/{CloneRetryStopAttempts} 次失败：{error}");
+                LogService.DebugFile($"停止加速（带重试）第 {attempt}/{CloneRetryStopAttempts} 次失败：{error}");
                 if (attempt < CloneRetryStopAttempts) await Task.Delay(CloneRetryDelayMs);
             }
             return (false, error);
@@ -1611,14 +1613,10 @@ namespace FlyDisk
                 int diskNumber = _target.LocalDiskNumber;
                 RemotePeer? peer = _peer;
 
-                EngineResult stopped = await Task.Run(_target.Stop);
-                if (!stopped.Ok)
-                {
-                    // 被拒（还有别的 iSCSI 连接挂着）：如实弹出来，否则用户只看到按钮弹回来、以为程序卡了
-                    Log(Locale.T("main.log.stopFailed", stopped.Message));
-                    MessageBox.Show(stopped.Message, Locale.T("dialog.stopRejected"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
+                // ① 先按节拍**重试**正常停止：刚建立的会话、或设备一时忙（ISDSC_DEVICE_BUSY_ON_SESSION），
+                //    再试几次往往就能摘干净。重试仍失败再判"是不是只剩自己的会话摘不掉"（见 ResolveStopFailure）。
+                (bool stopped, string stopError) = await TryStopWithRetry();
+                if (!stopped && !await ResolveStopFailure(stopError)) return;
 
                 if (peer != null)
                 {
@@ -1647,6 +1645,49 @@ namespace FlyDisk
                 _targetOperationPending = false;
                 RefreshStatus();
             }
+        }
+
+        /// <summary>
+        /// 正常停止失败后的收尾判定：
+        /// - 若只剩**本程序自己**那条 iSCSI 会话摘不掉（设备忙），如实说明并询问是否**强制停止**（有数据风险）；
+        /// - 否则说明还有**外部 / 额外**发起程序，维持原提示（去 iSCSI 发起程序手动断开确实有意义）。
+        /// 返回 <c>true</c> = 已停下（强制成功），调用方可继续后续收尾；<c>false</c> = 未停下，调用方直接返回。
+        /// </summary>
+        private async Task<bool> ResolveStopFailure(string stopError)
+        {
+            if (!_target.IsOnlyAutoSessionRemaining())
+            {
+                // 确有外部 / 额外发起程序：如实拒绝（手动断开有意义）
+                Log(Locale.T("main.log.stopFailed", stopError));
+                MessageBox.Show(stopError, Locale.T("dialog.stopRejected"),
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            // 只剩自己那条会话、且登不掉（典型是 ISDSC_DEVICE_BUSY_ON_SESSION）：说明 + 提供强制停止
+            Log(Locale.T("main.msg.ownSessionStuck"));
+
+            DialogResult answer = MessageBox.Show(
+                Locale.T("main.msg.stopForcePrompt"),
+                Locale.T("dialog.stopForce"),
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes)
+            {
+                Log(Locale.T("main.log.stopFailed", stopError));
+                return false;
+            }
+
+            EngineResult forced = await Task.Run(_target.ForceStop);
+            if (!forced.Ok)
+            {
+                Log(Locale.T("main.log.stopFailed", forced.Message));
+                MessageBox.Show(forced.Message, Locale.T("dialog.stopRejected"),
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            Log(Locale.T("main.log.stopForced"));
+            return true;
         }
 
         /// <summary>
