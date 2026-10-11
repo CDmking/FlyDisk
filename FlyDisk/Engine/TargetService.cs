@@ -357,6 +357,12 @@ namespace FlyDisk.Engine
             int connections = GetActiveConnectionCount();
             if (connections > 0)
             {
+                // 记下拒绝时的现场：连接数、自己的会话还在不在、以及最后一次登出错误码
+                // （0xEFFF0040 = ISDSC_DEVICE_BUSY_ON_SESSION 是"同签名克隆盘无法移除"的典型特征）。
+                LogService.DebugFile(
+                    $"停止被拒：本机端口仍 {connections} 条 ESTABLISHED 连接；自身会话 IsMounted={_initiator.IsMounted}、" +
+                    $"CountSessions={IscsiInitiator.CountSessions(_config.TargetIqn)}、" +
+                    $"LastLogoutError=0x{_initiator.LastLogoutError:X8}");
                 return EngineResult.Reject(Locale.T("main.msg.iscsiDisconnectFailed"));
             }
 
@@ -389,29 +395,75 @@ namespace FlyDisk.Engine
 
             try
             {
-                // 先按正常路径摘一次自动挂载的会话（登不出去也不影响后面）。结果只用于日志区分。
-                _initiator.Disconnect();
-                bool orderlyUnmount = !_initiator.IsMounted;
-
-                // 无论摘没摘干净，都走完整收尾：停 target（中止服务、掐断所有会话）→ 关 LUN 后端 →
-                // 等在途命令跑完 → 冻结并落 L2 账本 → 关句柄（盘保持脱机）。
-                StopCore(restoreDeviceState: false);
-
-                if (IsStopping)
-                {
-                    LogService.DebugFile("shutdown stop: in-flight IO did not finish; L2 ledger not committed");
-                    return false;
-                }
-                LogService.DebugFile(orderlyUnmount
-                    ? "shutdown stop: orderly stop done; healthy L2 ledger commit attempted"
-                    : "shutdown stop: forced stop (initiator logout failed); healthy L2 ledger commit attempted");
-                return true;
+                return ForceStopCoreLocked("shutdown stop");
             }
             catch (Exception ex)
             {
                 // 关机路径**绝不外抛**：异常会被 ThreadException 兜住并弹窗，从而卡住关机。
                 LogService.DebugFile($"shutdown stop failed: {ex.Message}");
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// **用户显式触发**的强制停止（等价于关机路径，但不外抛）。正常停止被"有连接就拒绝"卡住、
+        /// 界面已确认"只剩本程序自己的会话摘不掉"、并已向用户警示数据风险之后调用。
+        ///
+        /// 与 <see cref="Stop"/> 的唯一区别是**不做连接守卫**：登不出去也照样停 target（中止服务、掐断
+        /// 会话）、落 L2 账本、盘保持脱机。代价与关机路径相同（挂着的 NTFS 可能收到介质错误），
+        /// 故**必须**由界面在确认后调用。
+        /// </summary>
+        /// <returns>完成收尾返回 <see cref="EngineResult.Success"/>；若在途命令未结束时返回
+        /// <see cref="EngineResult.Rejected"/>（消息 <c>engine.stop.pending</c>，已转入后台收尾）</returns>
+        public EngineResult ForceStop()
+        {
+            lock (_lifecycleLock)
+            {
+                if (!IsRunning) return EngineResult.Success;
+                return ForceStopCoreLocked("forced stop")
+                    ? EngineResult.Success
+                    : EngineResult.Reject(Locale.T("engine.stop.pending"));
+            }
+        }
+
+        /// <summary>
+        /// 强制收尾核心（调用方须已持 <see cref="_lifecycleLock"/>）：不判"有没有连接"，直接摘会话
+        /// （登出失败也继续）→ <see cref="StopCore"/>（停 target、掐会话、等在途、落 L2 账本、盘保持脱机）。
+        /// </summary>
+        /// <returns><c>true</c> = 在途命令已静止、收尾完成；<c>false</c> = 已转入后台收尾（见 <see cref="IsStopping"/>）</returns>
+        private bool ForceStopCoreLocked(string tag)
+        {
+            // 先按正常路径摘一次自动挂载的会话（登不出去也不影响后面）。结果只用于日志区分。
+            _initiator.Disconnect();
+            bool orderlyUnmount = !_initiator.IsMounted;
+
+            // 无论摘没摘干净，都走完整收尾：停 target（中止服务、掐断所有会话）→ 关 LUN 后端 →
+            // 等在途命令跑完 → 冻结并落 L2 账本 → 关句柄（盘保持脱机）。
+            StopCore(restoreDeviceState: false);
+
+            if (IsStopping)
+            {
+                LogService.DebugFile($"{tag}: in-flight IO did not finish; L2 ledger not committed");
+                return false;
+            }
+            LogService.DebugFile(orderlyUnmount
+                ? $"{tag}: orderly stop done; healthy L2 ledger commit attempted"
+                : $"{tag}: forced stop (initiator logout failed); healthy L2 ledger commit attempted");
+            return true;
+        }
+
+        /// <summary>
+        /// 正常停止被拒后，判断"是不是**只有本程序自己那条 iSCSI 会话**摘不掉"（而非外部发起程序）。
+        /// <c>true</c> 时界面应提供"强制停止"兜底，而不是让用户去 iSCSI 发起程序手动断开（手动同样断不了）。
+        /// 无法判断时返回 <c>false</c>：宁可维持"外部连接"的旧提示，也不误导用户去强制停止。
+        /// </summary>
+        public bool IsOnlyAutoSessionRemaining()
+        {
+            lock (_lifecycleLock)
+            {
+                if (!IsRunning) return false;
+                if (!_initiator.IsMounted) return false;   // 自己的已摘干净 ⇒ 剩下的都是外部连接
+                return IscsiInitiator.CountSessions(_config.TargetIqn) <= 1;
             }
         }
 
