@@ -220,6 +220,7 @@ wevtutil qe System /q:"*[System[Provider[@Name='disk']]]" /c:40 /rd:true /f:text
 ### 9.5 仍未做的
 
 - **根因未查明**（§5、§6）。
+- 停止失败时"只剩自己的会话摘不掉"的**强制停止兜底**已在 §11 落地（2026-10）；但 USB 场景的**持续 device busy** 根因仍未查明。
 - §8.3 的"尝试自动联机克隆盘"、§8.4 的运行期源盘守卫，都还是待办。
 
 ## 10. 代码里的诊断相关代码（现状）
@@ -237,3 +238,39 @@ wevtutil qe System /q:"*[System[Provider[@Name='disk']]]" /c:40 /rd:true /f:text
 
 曾经加入、**已全部撤除**的临时实验代码：只脱机不连 iSCSI 的诊断入口、登录前 15 秒等待、VPD 页 0x80 序列号前缀、`persist: false`。
 （`persist` 已改回 `true`。）
+
+## 11. USB 易驱线变体：停止时持续 `ISDSC_DEVICE_BUSY_ON_SESSION`（2026-10）
+
+### 11.1 现象（与 §1 同源，但发生在**停止**时）
+
+用户用 **SATA→USB-C 易驱线** 加速 2.5" 硬盘（`config.json` 里目标盘型号 = `Shenzhen YongzhenWeiye`，
+即 USB 桥厂商串）。启动加速时 §9 的「克隆盘检查 + 一轮自动恢复」**正常工作**：首次（联机起步）克隆盘被判
+脱机+只读，自动从脱机重启后克隆盘变正常，加速可用。
+
+但**停止加速**时：`LogoutIScsiTarget` 持续失败，`debug-security.log` 连续 7 次
+`Logout rc=0xEFFF0040`（跨 15 分钟），于是 `Stop()` 里"有连接就拒绝停止"的守卫把自己那条摘不掉的会话数进去，
+报 `main.msg.iscsiDisconnectFailed`；去 iSCSI 发起程序手动断开同样失败；最终只能重启系统（走关机路径强制收尾）。
+
+### 11.2 关键证据
+
+- `0xEFFF0040` = **`ISDSC_DEVICE_BUSY_ON_SESSION`**（设备忙、无法从设备栈移除）。这与 §3.7 的"刚建立的
+  会话没法立刻登出"（时序型、几秒自愈）**不同**，是**持续**的 device busy。
+- 差集法仍能识别克隆盘（日志 `克隆盘检查：新出现的磁盘 2 …`），故本程序这一侧并无失灵。
+- 触发条件与 §5 一致：源盘（USB 桥接）与整盘块级克隆的 iSCSI 盘**同磁盘签名 + 同上报序列号**，而源盘仍
+  物理在位（仅脱机），Windows 拒绝移除克隆设备。
+
+### 11.3 已落地的缓解（不是修根因）
+
+- **停止带重试**：`Form1.TryStopWithRetry`（3 次 × 1 秒），克隆盘恢复与用户点「停止加速」共用。
+- **区分"自己的会话"与"外部发起程序"**：`TargetService.IsOnlyAutoSessionRemaining()`（判据 = `IsMounted`
+  且 `IscsiInitiator.CountSessions(Iqn) <= 1`）。
+- **强制停止兜底**：`TargetService.ForceStop()`（等价关机路径、不做连接守卫），仅在界面**警示数据风险**、
+  用户确认后调用；只在"只剩自己的会话摘不掉"时提供（有外部连接时仍维持原提示）。
+- 相关文案键：`main.msg.ownSessionStuck` / `main.msg.stopForcePrompt` / `main.log.stopForced` / `dialog.stopForce`；
+  诊断侧新增 `IscsiInitiator.LastLogoutError` 与停止被拒时的现场日志。
+
+### 11.4 仍然没做
+
+- **根因未查明**（同 §5）：Windows 依据什么把 USB 源盘与 iSCSI 克隆盘判为同一设备的多路径、以及为何因此
+  拒绝移除。系统事件 **Event ID 158** 的第一站取证仍待执行。
+- 无法保证每次停止都不走到强制停止；强制停止有数据风险（挂着的 NTFS 可能收到介质错误、未落盘写入可能丢失）。

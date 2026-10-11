@@ -59,6 +59,12 @@
   "有连接就拒绝停止"的守卫**——关机时 L2 账本必须落盘，即便发起程序登不出去，也照样中止 iSCSI 服务、掐断会话再落账本。
   该路径**绝不外抛**（抛出会被 `ThreadException` 兜住并弹窗、反卡关机），收尾只落 `debug-security.log`。
   运行中点「停止加速」则**绝不**这样干。
+- **停止失败的兜底（`ISDSC_DEVICE_BUSY_ON_SESSION`）**：正常停止先在 UI 层**重试**（`Form1.TryStopWithRetry`，
+  3 次 × 1 秒）；重试仍被拒时，若只剩**本程序自己**那条会话摘不掉（`TargetService.IsOnlyAutoSessionRemaining`，
+  判据 = `IsMounted` 且 `IscsiInitiator.CountSessions(Iqn) <= 1`），界面在**警示数据风险**后提供
+  `TargetService.ForceStop()`（等价关机路径、不做连接守卫）；只有确有**外部/额外**发起程序时才维持
+  "去 iSCSI 发起程序手动断开"的提示。案例（USB 易驱线、持续 device busy）见
+  `docs/iSCSI克隆盘被判冗余路径_排障记录.md` §11。
 - **自动挂载**（`Engine/IscsiInitiator.cs`）：`MSiSCSI 服务在跑 → AddIScsiSendTargetPortalW → LoginIScsiTargetW`；
   **只清理本程序的会话/门户，不停止系统 MSiSCSI 服务**。两处硬约束：`IsInformationalSession = false`（为真 PnP 不枚举 LUN）、
   `IsPersistent = false`（为真会写持久登录、与本程序全权管生管死冲突）。任一步失败**不硬失败**，只记录 + 提示手动挂载。
