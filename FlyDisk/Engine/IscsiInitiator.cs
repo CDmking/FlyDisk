@@ -179,6 +179,12 @@ namespace FlyDisk.Engine
         /// <summary>当前是否有一条由本对象建立的会话（供界面/日志判断）</summary>
         public bool IsMounted => _hasSession;
 
+        /// <summary>
+        /// 最近一次 <c>LogoutIScsiTarget</c> 的返回码（<c>0</c> = 成功）。登出失败时供界面/诊断说明原因，
+        /// 例如 <c>0xEFFF0040</c> = <c>ISDSC_DEVICE_BUSY_ON_SESSION</c>（设备忙、无法从设备栈移除）。
+        /// </summary>
+        public uint LastLogoutError { get; private set; }
+
         #endregion
 
         #region 挂载
@@ -260,6 +266,7 @@ namespace FlyDisk.Engine
                 {
                     uint rc = LogoutIScsiTarget(ref id);
                     loggedOut = rc == ERROR_SUCCESS;
+                    LastLogoutError = loggedOut ? ERROR_SUCCESS : rc;
                     LogService.DebugFile(
                         $"iSCSI initiator: Logout rc=0x{rc:X8}, session={SessionText}");
                 }
@@ -472,6 +479,25 @@ namespace FlyDisk.Engine
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// target 名等于该 IQN 的**会话数**（按会话 id 去重）。用于停止时区分"只有本程序自己的会话"与
+        /// "还有别的发起程序"：<see cref="EnumerateSessions"/> 里同一会话可能因两个名字字段各记一条，
+        /// 故这里按 id 去重后再数。服务未运行 / 查询失败时返回 <c>0</c>（调用方应按"探不到"保守处理）。
+        /// </summary>
+        public static int CountSessions(string iqn)
+        {
+            if (string.IsNullOrWhiteSpace(iqn)) return 0;
+
+            var seen = new HashSet<(ulong, ulong)>();
+            int count = 0;
+            foreach ((ISCSI_UNIQUE_SESSION_ID id, string target) in EnumerateSessions())
+            {
+                if (!IsKnownTargetName(target, iqn)) continue;
+                if (seen.Add((id.AdapterUnique, id.AdapterSpecific))) count++;
+            }
+            return count;
         }
 
         /// <summary>目标名是否属于我们要清理的那个 IQN</summary>
